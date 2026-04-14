@@ -131,9 +131,10 @@ type reminderRequest struct {
 }
 
 type appointmentRequest struct {
-	Therapist       string `json:"therapist"`
-	SessionMode     string `json:"session_mode"`
-	AppointmentTime string `json:"appointment_time"`
+	Therapist         string `json:"therapist"`
+	SessionMode       string `json:"session_mode"`
+	AppointmentTime   string `json:"appointment_time"`
+	NotificationPhone string `json:"notification_phone"`
 }
 
 type communityMessageRequest struct {
@@ -380,6 +381,8 @@ func main() {
 	// mux.HandleFunc("/ws/care", s.handleCareSocket)
 	mux.HandleFunc("/", s.serveFrontend)
 
+	go s.startAutomaticMotivationScheduler()
+
 	log.Printf("server running at http://localhost:%s", port)
 	if err := http.ListenAndServe(":"+port, withCORS(mux)); err != nil {
 		log.Fatal(err)
@@ -531,6 +534,16 @@ func openDB(path string) (*sql.DB, error) {
 		FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
 	);
 
+	CREATE TABLE IF NOT EXISTS auto_motivation_schedules (
+		user_id INTEGER PRIMARY KEY,
+		next_send_at DATETIME NOT NULL,
+		last_sent_at DATETIME,
+		last_error TEXT NOT NULL DEFAULT '',
+		created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+		updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+		FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+	);
+
 	CREATE TABLE IF NOT EXISTS admission_assessments (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
 		user_id INTEGER NOT NULL,
@@ -558,6 +571,7 @@ func openDB(path string) (*sql.DB, error) {
 	_, _ = db.Exec("CREATE INDEX IF NOT EXISTS idx_chw_links_chw_user ON chw_links(chw_user_id)")
 	_, _ = db.Exec("CREATE INDEX IF NOT EXISTS idx_care_messages_room_created ON care_messages(room_id, created_at)")
 	_, _ = db.Exec("CREATE INDEX IF NOT EXISTS idx_admission_assessments_user_created ON admission_assessments(user_id, created_at)")
+	_, _ = db.Exec("CREATE INDEX IF NOT EXISTS idx_auto_motivation_next_send ON auto_motivation_schedules(next_send_at)")
 
 	return db, nil
 }
@@ -634,6 +648,10 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to load user")
 		return
+	}
+
+	if user.Role == roleMentalHealthUser && strings.TrimSpace(user.Phone) != "" {
+		s.ensureAutoMotivationSchedule(user.ID, time.Now().UTC().Add(2*time.Hour))
 	}
 
 	writeJSON(w, http.StatusCreated, authResponse{Token: token, User: user})
@@ -1429,6 +1447,7 @@ func (s *Server) handleCreateAppointment(w http.ResponseWriter, r *http.Request,
 	req.Therapist = strings.TrimSpace(req.Therapist)
 	req.SessionMode = strings.TrimSpace(req.SessionMode)
 	req.AppointmentTime = strings.TrimSpace(req.AppointmentTime)
+	req.NotificationPhone = strings.TrimSpace(req.NotificationPhone)
 
 	if req.Therapist == "" || req.SessionMode == "" || req.AppointmentTime == "" {
 		writeError(w, http.StatusBadRequest, "therapist, session_mode, and appointment_time are required")
@@ -1456,16 +1475,23 @@ func (s *Server) handleCreateAppointment(w http.ResponseWriter, r *http.Request,
 		req.AppointmentTime,
 	)
 	smsStatus, smsError := s.notifyReminderBySMS(r.Context(), user.ID, "Therapy session reminder", req.AppointmentTime)
-	chwSMSStatus, chwSMSWarning := s.notifyAppointmentToCHW(r.Context(), user.ID, req.Therapist, req.SessionMode, req.AppointmentTime)
+	contactSMSStatus, contactSMSWarning := s.notifyAppointmentContactBySMS(
+		r.Context(),
+		user.ID,
+		req.NotificationPhone,
+		req.Therapist,
+		req.SessionMode,
+		req.AppointmentTime,
+	)
 
 	writeJSON(w, http.StatusCreated, map[string]any{
-		"id":              id,
-		"reward_points":   points,
-		"message":         "virtual therapist session booked",
-		"sms_status":      smsStatus,
-		"sms_warning":     smsError,
-		"chw_sms_status":  chwSMSStatus,
-		"chw_sms_warning": chwSMSWarning,
+		"id":                  id,
+		"reward_points":       points,
+		"message":             "virtual therapist session booked",
+		"sms_status":          smsStatus,
+		"sms_warning":         smsError,
+		"contact_sms_status":  contactSMSStatus,
+		"contact_sms_warning": contactSMSWarning,
 	})
 }
 
@@ -1934,6 +1960,126 @@ func (s *Server) handleVoiceHelpline(w http.ResponseWriter, r *http.Request, use
 	}[lang]
 
 	writeJSON(w, http.StatusOK, map[string]any{"language": lang, "script": script})
+}
+
+func (s *Server) startAutomaticMotivationScheduler() {
+	if strings.TrimSpace(s.smsAPIKey) == "" {
+		log.Println("automatic motivation scheduler is disabled: DEVTEXT_API_KEY is missing")
+		return
+	}
+
+	if err := s.ensureAutomaticMotivationSchedules(); err != nil {
+		log.Printf("automatic motivation scheduler bootstrap failed: %v", err)
+	}
+	s.processAutomaticMotivations()
+
+	ticker := time.NewTicker(time.Minute)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		s.processAutomaticMotivations()
+	}
+}
+
+func (s *Server) ensureAutomaticMotivationSchedules() error {
+	_, err := s.db.Exec(
+		`INSERT OR IGNORE INTO auto_motivation_schedules(user_id, next_send_at)
+		 SELECT id, datetime(created_at, '+2 hours')
+		 FROM users
+		 WHERE role = ? AND TRIM(phone) <> ''`,
+		roleMentalHealthUser,
+	)
+	return err
+}
+
+func (s *Server) ensureAutoMotivationSchedule(userID int64, nextSendAt time.Time) {
+	_, err := s.db.Exec(
+		`INSERT INTO auto_motivation_schedules(user_id, next_send_at, updated_at)
+		 VALUES(?, ?, CURRENT_TIMESTAMP)
+		 ON CONFLICT(user_id) DO NOTHING`,
+		userID,
+		formatSQLiteDateTime(nextSendAt),
+	)
+	if err != nil {
+		log.Printf("failed to create auto motivation schedule for user %d: %v", userID, err)
+	}
+}
+
+func (s *Server) processAutomaticMotivations() {
+	if err := s.ensureAutomaticMotivationSchedules(); err != nil {
+		log.Printf("failed to refresh auto motivation schedules: %v", err)
+		return
+	}
+
+	rows, err := s.db.Query(
+		`SELECT s.user_id, u.phone, u.language
+		 FROM auto_motivation_schedules s
+		 JOIN users u ON u.id = s.user_id
+		 WHERE u.role = ? AND TRIM(u.phone) <> ''
+		   AND datetime(s.next_send_at) <= datetime('now')
+		 ORDER BY s.next_send_at ASC
+		 LIMIT 100`,
+		roleMentalHealthUser,
+	)
+	if err != nil {
+		log.Printf("failed to load due auto motivations: %v", err)
+		return
+	}
+	defer rows.Close()
+
+	type dueMotivation struct {
+		userID   int64
+		phone    string
+		language string
+	}
+
+	due := make([]dueMotivation, 0, 16)
+	for rows.Next() {
+		var item dueMotivation
+		if err := rows.Scan(&item.userID, &item.phone, &item.language); err != nil {
+			log.Printf("failed to scan due auto motivation row: %v", err)
+			return
+		}
+		due = append(due, item)
+	}
+
+	for _, item := range due {
+		s.sendAutomaticMotivation(item.userID, item.phone, item.language)
+	}
+}
+
+func (s *Server) sendAutomaticMotivation(userID int64, phone, language string) {
+	phone = strings.TrimSpace(phone)
+	if phone == "" {
+		return
+	}
+
+	message := pickMotivation(normalizeLanguage(language))
+	if !strings.HasPrefix(message, "AfyaMind:") {
+		message = "AfyaMind: " + message
+	}
+
+	status, warning := s.sendAndLogSMS(context.Background(), userID, phone, message)
+	if status == "failed" {
+		_, _ = s.db.Exec(
+			`UPDATE auto_motivation_schedules
+			 SET next_send_at = ?, last_error = ?, updated_at = CURRENT_TIMESTAMP
+			 WHERE user_id = ?`,
+			formatSQLiteDateTime(time.Now().UTC().Add(15*time.Minute)),
+			warning,
+			userID,
+		)
+		log.Printf("automatic motivation SMS failed for user %d: %s", userID, warning)
+		return
+	}
+
+	_, _ = s.db.Exec(
+		`UPDATE auto_motivation_schedules
+		 SET next_send_at = ?, last_sent_at = CURRENT_TIMESTAMP, last_error = '', updated_at = CURRENT_TIMESTAMP
+		 WHERE user_id = ?`,
+		formatSQLiteDateTime(time.Now().UTC().Add(2*time.Hour)),
+		userID,
+	)
 }
 
 func (s *Server) handleResources(w http.ResponseWriter, _ *http.Request, _ AuthUser) {
@@ -2661,21 +2807,8 @@ func (s *Server) notifyReminderBySMS(ctx context.Context, userID int64, title, s
 		return "skipped", "patient phone number is not on file"
 	}
 
-	message := fmt.Sprintf("AfyaMind reminder: %s at %s", title, scheduleTime)
-	result, err := s.sendSMSViaDevText(ctx, phone, message)
-	if err != nil {
-		return "failed", err.Error()
-	}
-
-	_, _ = s.db.Exec(
-		"INSERT INTO sms_logs(user_id, to_number, message, provider_status, provider_id) VALUES(?, ?, ?, ?, ?)",
-		userID,
-		phone,
-		message,
-		result.ProviderStatus,
-		result.ProviderID,
-	)
-	return result.ProviderStatus, ""
+	message := fmt.Sprintf("AfyaMind reminder: %s on %s.", title, humanizeSMSDateTime(scheduleTime))
+	return s.sendAndLogSMS(ctx, userID, phone, message)
 }
 
 func (s *Server) notifyAppointmentToCHW(ctx context.Context, userID int64, therapist, sessionMode, appointmentTime string) (string, string) {
@@ -2690,13 +2823,38 @@ func (s *Server) notifyAppointmentToCHW(ctx context.Context, userID int64, thera
 	}
 
 	message := fmt.Sprintf(
-		"AfyaMind booking: %s booked a %s session with %s for %s.",
+		"AfyaMind booking: %s you booked a %s session with %s on %s.",
 		userRecord.Name,
 		strings.ReplaceAll(sessionMode, "_", " "),
 		therapist,
-		appointmentTime,
+		humanizeSMSDateTime(appointmentTime),
 	)
-	result, err := s.sendSMSViaDevText(ctx, phone, message)
+	return s.sendAndLogSMS(ctx, userID, phone, message)
+}
+
+func (s *Server) notifyAppointmentContactBySMS(ctx context.Context, userID int64, contactPhone, therapist, sessionMode, appointmentTime string) (string, string) {
+	phone := strings.TrimSpace(contactPhone)
+	if phone == "" {
+		return s.notifyAppointmentToCHW(ctx, userID, therapist, sessionMode, appointmentTime)
+	}
+
+	userRecord, err := s.getUserByID(userID)
+	if err != nil {
+		return "failed", err.Error()
+	}
+
+	message := fmt.Sprintf(
+		"AfyaMind booking: %s you booked a %s session with %s on %s.",
+		userRecord.Name,
+		strings.ReplaceAll(sessionMode, "_", " "),
+		therapist,
+		humanizeSMSDateTime(appointmentTime),
+	)
+	return s.sendAndLogSMS(ctx, userID, phone, message)
+}
+
+func (s *Server) sendAndLogSMS(ctx context.Context, userID int64, to, message string) (string, string) {
+	result, err := s.sendSMSViaDevText(ctx, to, message)
 	if err != nil {
 		return "failed", err.Error()
 	}
@@ -2704,12 +2862,37 @@ func (s *Server) notifyAppointmentToCHW(ctx context.Context, userID int64, thera
 	_, _ = s.db.Exec(
 		"INSERT INTO sms_logs(user_id, to_number, message, provider_status, provider_id) VALUES(?, ?, ?, ?, ?)",
 		userID,
-		phone,
+		to,
 		message,
 		result.ProviderStatus,
 		result.ProviderID,
 	)
 	return result.ProviderStatus, ""
+}
+
+func humanizeSMSDateTime(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "the scheduled time"
+	}
+
+	layouts := []string{
+		time.RFC3339,
+		"2006-01-02T15:04",
+		"2006-01-02 15:04:05",
+		"2006-01-02 15:04",
+	}
+	for _, layout := range layouts {
+		if parsed, err := time.Parse(layout, value); err == nil {
+			return parsed.Local().Format("02 Jan 2006 3:04 PM")
+		}
+	}
+
+	return value
+}
+
+func formatSQLiteDateTime(t time.Time) string {
+	return t.UTC().Format("2006-01-02 15:04:05")
 }
 
 func (s *Server) addRewardPoints(userID int64, points int) (int, error) {
