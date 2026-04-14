@@ -2,10 +2,16 @@ package main
 
 import (
 	"context"
+	"crypto"
 	"crypto/rand"
+	"crypto/rsa"
+	"crypto/sha256"
+	"crypto/x509"
 	"database/sql"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"io"
@@ -19,32 +25,42 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
-	_ "github.com/mattn/go-sqlite3"
 	"golang.org/x/crypto/bcrypt"
+	_ "modernc.org/sqlite"
 )
 
 type Server struct {
-	db            *sql.DB
-	httpClient    *http.Client
-	smsURL        string
-	smsAPIKey     string
-	frontendDist  string
-	aiProvider    string
-	llamaModel    string
-	llamaChatURL  string
-	openAIAPIKey  string
-	openAIModel   string
-	openAIChatURL string
-	careRooms     map[string]map[*careClient]struct{}
-	careMu        sync.RWMutex
-	wsUpgrader    websocket.Upgrader
+	db              *sql.DB
+	httpClient      *http.Client
+	smsURL          string
+	smsAPIKey       string
+	frontendDist    string
+	aiProvider      string
+	llamaModel      string
+	llamaChatURL    string
+	openAIAPIKey    string
+	openAIModel     string
+	openAIChatURL   string
+	geminiAPIKey    string
+	geminiModel     string
+	geminiChatURL   string
+	vertexProjectID string
+	vertexLocation  string
+	vertexModel     string
+	vertexEndpoint  string
+	vertexSAJSON    string
+	communityRooms  map[string]map[*websocket.Conn]struct{}
+	careRooms       map[string]map[*careClient]struct{}
+	communityMu     sync.RWMutex
+	careMu          sync.RWMutex
+	wsUpgrader      websocket.Upgrader
 }
 
 type careClient struct {
-	conn   *websocket.Conn
-	roomID string
-	user   AuthUser
-	server *Server
+	conn    *websocket.Conn
+	roomID  string
+	user    AuthUser
+	server  *Server
 	writeMu sync.Mutex
 }
 
@@ -52,6 +68,7 @@ type AuthUser struct {
 	ID       int64  `json:"id"`
 	Name     string `json:"name"`
 	Email    string `json:"email"`
+	Phone    string `json:"phone"`
 	Language string `json:"language"`
 	Role     string `json:"role"`
 }
@@ -64,6 +81,7 @@ const (
 type registerRequest struct {
 	Name     string `json:"name"`
 	Email    string `json:"email"`
+	Phone    string `json:"phone"`
 	Password string `json:"password"`
 	Language string `json:"language"`
 	Role     string `json:"role"`
@@ -89,12 +107,22 @@ type checkinRequest struct {
 }
 
 type admissionRequest struct {
-	PHQ9Answers []int    `json:"phq9_answers"`
-	Mood        *int     `json:"mood"`
-	Stress      *int     `json:"stress"`
-	Anxiety     *int     `json:"anxiety"`
-	SleepHours  *float64 `json:"sleep_hours"`
-	Note        string   `json:"note"`
+	PHQ9Answers         []int    `json:"phq9_answers"`
+	GAD7Answers         []int    `json:"gad7_answers"`
+	PCL5Answers         []int    `json:"pcl5_answers"`
+	KesslerAnswers      []int    `json:"kessler_answers"`
+	MDQAnswers          []bool   `json:"mdq_answers"`
+	MDQConcurrent       bool     `json:"mdq_concurrent"`
+	MDQImpairment       int      `json:"mdq_impairment"`
+	AUDITAnswers        []int    `json:"audit_answers"`
+	CSSRSAnswers        []bool   `json:"cssrs_answers"`
+	Mood                *int     `json:"mood"`
+	Stress              *int     `json:"stress"`
+	Anxiety             *int     `json:"anxiety"`
+	SleepHours          *float64 `json:"sleep_hours"`
+	Note                string   `json:"note"`
+	PrimaryConcern      string   `json:"primary_concern"`
+	SafetyContactNumber string   `json:"safety_contact_number"`
 }
 
 type reminderRequest struct {
@@ -137,6 +165,8 @@ type ussdRequest struct {
 type aiRequest struct {
 	Prompt   string `json:"prompt"`
 	Language string `json:"language"`
+	SendSMS  bool   `json:"send_sms"`
+	SMSTo    string `json:"sms_to"`
 }
 
 type languageRequest struct {
@@ -199,6 +229,32 @@ type phq9Assessment struct {
 	Item9     int
 }
 
+type screeningAssessment struct {
+	Key      string `json:"key"`
+	Title    string `json:"title"`
+	Score    int    `json:"score"`
+	MaxScore int    `json:"max_score"`
+	Level    string `json:"level"`
+	Risk     string `json:"risk"`
+	Summary  string `json:"summary"`
+}
+
+type exerciseRecommendation struct {
+	Key         string `json:"key"`
+	Title       string `json:"title"`
+	Duration    string `json:"duration"`
+	Description string `json:"description"`
+	Focus       string `json:"focus"`
+}
+
+type assessmentBundle struct {
+	PHQ9           phq9Assessment           `json:"phq9"`
+	Screenings     []screeningAssessment    `json:"screenings"`
+	PrimaryFocuses []string                 `json:"primary_focuses"`
+	Exercises      []exerciseRecommendation `json:"recommended_exercises"`
+	ProgressLabel  string                   `json:"progress_label"`
+}
+
 type careRecommendation struct {
 	Type    string
 	Message string
@@ -206,6 +262,8 @@ type careRecommendation struct {
 }
 
 func main() {
+	loadDotEnv(".env")
+
 	dbPath := envOrDefault("DB_PATH", "./mental_health.db")
 	port := envOrDefault("PORT", "8080")
 
@@ -216,18 +274,27 @@ func main() {
 	defer db.Close()
 
 	s := &Server{
-		db:            db,
-		httpClient:    &http.Client{Timeout: 15 * time.Second},
-		smsURL:        envOrDefault("DEVTEXT_SMS_URL", "https://devtext.site/v1/sms/send"),
-		smsAPIKey:     strings.TrimSpace(os.Getenv("DEVTEXT_API_KEY")),
-		frontendDist:  envOrDefault("FRONTEND_DIST", "../dist"),
-		aiProvider:    normalizeAIProvider(envOrDefault("AI_PROVIDER", "llama")),
-		llamaModel:    envOrDefault("LLAMA_MODEL", "llama3.2:3b"),
-		llamaChatURL:  envOrDefault("LLAMA_CHAT_URL", "http://127.0.0.1:11434/api/chat"),
-		openAIAPIKey:  strings.TrimSpace(os.Getenv("OPENAI_API_KEY")),
-		openAIModel:   envOrDefault("OPENAI_MODEL", "gpt-4.1-mini"),
-		openAIChatURL: envOrDefault("OPENAI_CHAT_URL", "https://api.openai.com/v1/chat/completions"),
-		careRooms:     make(map[string]map[*careClient]struct{}),
+		db:              db,
+		httpClient:      &http.Client{Timeout: 15 * time.Second},
+		smsURL:          envOrDefault("DEVTEXT_SMS_URL", "https://devtext.site/v1/sms/send"),
+		smsAPIKey:       strings.TrimSpace(os.Getenv("DEVTEXT_API_KEY")),
+		frontendDist:    envOrDefault("FRONTEND_DIST", "../dist"),
+		aiProvider:      normalizeAIProvider(envOrDefault("AI_PROVIDER", "vertex")),
+		llamaModel:      envOrDefault("LLAMA_MODEL", "llama3.2:3b"),
+		llamaChatURL:    envOrDefault("LLAMA_CHAT_URL", "http://127.0.0.1:11434/api/chat"),
+		openAIAPIKey:    strings.TrimSpace(os.Getenv("OPENAI_API_KEY")),
+		openAIModel:     envOrDefault("OPENAI_MODEL", "gpt-4.1-mini"),
+		openAIChatURL:   envOrDefault("OPENAI_CHAT_URL", "https://api.openai.com/v1/chat/completions"),
+		geminiAPIKey:    strings.TrimSpace(os.Getenv("GEMINI_API_KEY")),
+		geminiModel:     envOrDefault("GEMINI_MODEL", "gemini-2.5-flash"),
+		geminiChatURL:   envOrDefault("GEMINI_CHAT_URL", "https://generativelanguage.googleapis.com/v1beta/models"),
+		vertexProjectID: strings.TrimSpace(os.Getenv("VERTEX_PROJECT_ID")),
+		vertexLocation:  envOrDefault("VERTEX_LOCATION", "us-central1"),
+		vertexModel:     envOrDefault("VERTEX_MODEL", "gemini-2.0-flash-001"),
+		vertexEndpoint:  envOrDefault("VERTEX_ENDPOINT", "https://us-central1-aiplatform.googleapis.com"),
+		vertexSAJSON:    strings.TrimSpace(os.Getenv("VERTEX_SERVICE_ACCOUNT_JSON")),
+		communityRooms:  make(map[string]map[*websocket.Conn]struct{}),
+		careRooms:       make(map[string]map[*careClient]struct{}),
 		wsUpgrader: websocket.Upgrader{
 			CheckOrigin: func(r *http.Request) bool { return true },
 		},
@@ -298,6 +365,7 @@ func main() {
 			writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 		}
 	})
+	mux.HandleFunc("/ws/community", s.handleCommunitySocket)
 	// mux.HandleFunc("/api/care/messages", s.withAuth(s.handleListCareMessages))
 	mux.HandleFunc("/api/ussd/simulate", s.withAuth(s.handleSimulateUSSD))
 	mux.HandleFunc("/api/rewards", s.withAuth(s.handleGetRewards))
@@ -319,7 +387,7 @@ func main() {
 }
 
 func openDB(path string) (*sql.DB, error) {
-	db, err := sql.Open("sqlite3", path)
+	db, err := sql.Open("sqlite", path)
 	if err != nil {
 		return nil, err
 	}
@@ -336,6 +404,7 @@ func openDB(path string) (*sql.DB, error) {
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
 		name TEXT NOT NULL,
 		email TEXT NOT NULL UNIQUE,
+		phone TEXT NOT NULL DEFAULT '',
 		password_hash TEXT NOT NULL,
 		language TEXT NOT NULL DEFAULT 'en',
 		role TEXT NOT NULL DEFAULT 'mental_health_user',
@@ -461,6 +530,18 @@ func openDB(path string) (*sql.DB, error) {
 		created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
 		FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
 	);
+
+	CREATE TABLE IF NOT EXISTS admission_assessments (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		user_id INTEGER NOT NULL,
+		risk_level TEXT NOT NULL,
+		primary_focuses TEXT NOT NULL DEFAULT '[]',
+		screenings_json TEXT NOT NULL,
+		exercises_json TEXT NOT NULL,
+		note TEXT NOT NULL DEFAULT '',
+		created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+		FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+	);
 	`
 
 	if _, err := db.Exec(schema); err != nil {
@@ -468,6 +549,7 @@ func openDB(path string) (*sql.DB, error) {
 	}
 
 	_, _ = db.Exec("ALTER TABLE users ADD COLUMN role TEXT NOT NULL DEFAULT 'mental_health_user'")
+	_, _ = db.Exec("ALTER TABLE users ADD COLUMN phone TEXT NOT NULL DEFAULT ''")
 	_, _ = db.Exec("ALTER TABLE chw_links ADD COLUMN chw_user_id INTEGER")
 	_, _ = db.Exec("UPDATE users SET role = 'mental_health_user' WHERE role IS NULL OR TRIM(role) = '' OR LOWER(TRIM(role)) = 'user'")
 	_, _ = db.Exec("UPDATE users SET role = 'community_health_worker' WHERE LOWER(TRIM(role)) IN ('chw', 'community health worker', 'community_health_worker')")
@@ -475,6 +557,7 @@ func openDB(path string) (*sql.DB, error) {
 	_, _ = db.Exec("CREATE INDEX IF NOT EXISTS idx_chw_links_name_user ON chw_links(chw_name, user_id)")
 	_, _ = db.Exec("CREATE INDEX IF NOT EXISTS idx_chw_links_chw_user ON chw_links(chw_user_id)")
 	_, _ = db.Exec("CREATE INDEX IF NOT EXISTS idx_care_messages_room_created ON care_messages(room_id, created_at)")
+	_, _ = db.Exec("CREATE INDEX IF NOT EXISTS idx_admission_assessments_user_created ON admission_assessments(user_id, created_at)")
 
 	return db, nil
 }
@@ -492,11 +575,16 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 
 	req.Name = strings.TrimSpace(req.Name)
 	req.Email = strings.ToLower(strings.TrimSpace(req.Email))
+	req.Phone = strings.TrimSpace(req.Phone)
 	req.Language = normalizeLanguage(req.Language)
 	req.Role = normalizeRole(req.Role)
 
 	if req.Name == "" || req.Email == "" || req.Password == "" {
 		writeError(w, http.StatusBadRequest, "name, email, and password are required")
+		return
+	}
+	if req.Role == roleMentalHealthUser && req.Phone == "" {
+		writeError(w, http.StatusBadRequest, "phone is required for patients")
 		return
 	}
 	if len(req.Password) < 8 {
@@ -511,9 +599,10 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 	}
 
 	res, err := s.db.Exec(
-		"INSERT INTO users(name, email, password_hash, language, role) VALUES(?, ?, ?, ?, ?)",
+		"INSERT INTO users(name, email, phone, password_hash, language, role) VALUES(?, ?, ?, ?, ?, ?)",
 		req.Name,
 		req.Email,
+		req.Phone,
 		string(hash),
 		req.Language,
 		req.Role,
@@ -569,9 +658,9 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	)
 
 	err := s.db.QueryRow(
-		"SELECT id, name, email, language, role, password_hash FROM users WHERE email = ?",
+		"SELECT id, name, email, phone, language, role, password_hash FROM users WHERE email = ?",
 		req.Email,
-	).Scan(&user.ID, &user.Name, &user.Email, &user.Language, &user.Role, &hash)
+	).Scan(&user.ID, &user.Name, &user.Email, &user.Phone, &user.Language, &user.Role, &hash)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			writeError(w, http.StatusUnauthorized, "invalid credentials")
@@ -635,35 +724,40 @@ func (s *Server) handleLinkCHW(w http.ResponseWriter, r *http.Request, user Auth
 	if req.Region == "" {
 		req.Region = "Nairobi"
 	}
-	if req.CHWUserID > 0 {
-		var linkedCHW AuthUser
-		err := s.db.QueryRow(
-			"SELECT id, name, email, language, role FROM users WHERE id = ?",
-			req.CHWUserID,
-		).Scan(&linkedCHW.ID, &linkedCHW.Name, &linkedCHW.Email, &linkedCHW.Language, &linkedCHW.Role)
-		if err != nil {
-			if errors.Is(err, sql.ErrNoRows) {
-				writeError(w, http.StatusNotFound, "selected CHW account was not found")
-				return
-			}
-			writeError(w, http.StatusInternalServerError, "failed to load selected CHW")
-			return
-		}
-		if normalizeRole(linkedCHW.Role) != roleCommunityHealthWorker {
-			writeError(w, http.StatusBadRequest, "selected account is not a Community Health Worker")
-			return
-		}
-		if req.CHWName == "" {
-			req.CHWName = linkedCHW.Name
-		}
-	}
-
-	if req.CHWName == "" || req.Phone == "" {
-		writeError(w, http.StatusBadRequest, "chw_name, phone, and region are required")
+	if req.CHWUserID <= 0 {
+		writeError(w, http.StatusBadRequest, "patients must choose a registered CHW from the available list")
 		return
 	}
 
-	_, err := s.db.Exec(
+	var linkedCHW AuthUser
+	err := s.db.QueryRow(
+		"SELECT id, name, email, phone, language, role FROM users WHERE id = ?",
+		req.CHWUserID,
+	).Scan(&linkedCHW.ID, &linkedCHW.Name, &linkedCHW.Email, &linkedCHW.Phone, &linkedCHW.Language, &linkedCHW.Role)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			writeError(w, http.StatusNotFound, "selected CHW account was not found")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "failed to load selected CHW")
+		return
+	}
+	if normalizeRole(linkedCHW.Role) != roleCommunityHealthWorker {
+		writeError(w, http.StatusBadRequest, "selected account is not a Community Health Worker")
+		return
+	}
+
+	req.CHWName = linkedCHW.Name
+	req.Phone = strings.TrimSpace(linkedCHW.Phone)
+	if req.Phone == "" {
+		writeError(w, http.StatusBadRequest, "selected CHW does not have a phone number on file")
+		return
+	}
+	if req.Region == "" {
+		req.Region = "Nairobi"
+	}
+
+	_, err = s.db.Exec(
 		"INSERT INTO chw_links(user_id, chw_name, phone, region, chw_user_id) VALUES(?, ?, ?, ?, ?)",
 		user.ID,
 		req.CHWName,
@@ -676,8 +770,30 @@ func (s *Server) handleLinkCHW(w http.ResponseWriter, r *http.Request, user Auth
 		return
 	}
 
-	writeJSON(w, http.StatusCreated, map[string]string{
-		"message": "CHW linked successfully",
+	appointmentTime := time.Now().UTC().Add(24 * time.Hour).Format(time.RFC3339)
+	_, _ = s.db.Exec(
+		"INSERT INTO appointments(user_id, therapist, session_mode, appointment_time) VALUES(?, ?, ?, ?)",
+		user.ID,
+		req.CHWName,
+		"phone",
+		appointmentTime,
+	)
+	_, _ = s.db.Exec(
+		"INSERT INTO reminders(user_id, title, schedule_time) VALUES(?, ?, ?)",
+		user.ID,
+		"CHW follow-up appointment",
+		appointmentTime,
+	)
+	patientSMSStatus, patientSMSWarning := s.notifyReminderBySMS(r.Context(), user.ID, "CHW follow-up appointment", appointmentTime)
+	chwSMSStatus, chwSMSWarning := s.notifyAppointmentToCHW(r.Context(), user.ID, req.CHWName, "phone", appointmentTime)
+
+	writeJSON(w, http.StatusCreated, map[string]any{
+		"message":          "CHW linked successfully",
+		"appointment_time": appointmentTime,
+		"sms_status":       patientSMSStatus,
+		"sms_warning":      patientSMSWarning,
+		"chw_sms_status":   chwSMSStatus,
+		"chw_sms_warning":  chwSMSWarning,
 	})
 }
 
@@ -727,7 +843,6 @@ func (s *Server) handleGetCHWLink(w http.ResponseWriter, _ *http.Request, user A
 
 func (s *Server) handleListCHWDirectory(w http.ResponseWriter, _ *http.Request, _ AuthUser) {
 	items := make([]map[string]any, 0)
-	registeredByName := map[string]struct{}{}
 
 	rows, err := s.db.Query(
 		`SELECT
@@ -778,7 +893,6 @@ func (s *Server) handleListCHWDirectory(w http.ResponseWriter, _ *http.Request, 
 			return
 		}
 
-		registeredByName[canonicalName(name)] = struct{}{}
 		items = append(items, map[string]any{
 			"id":             id,
 			"name":           name,
@@ -787,49 +901,6 @@ func (s *Server) handleListCHWDirectory(w http.ResponseWriter, _ *http.Request, 
 			"region":         firstNonEmpty(region, "Unassigned"),
 			"caseload_count": caseloadCount,
 			"is_registered":  true,
-		})
-	}
-
-	manualRows, err := s.db.Query(
-		`SELECT
-			chw_name,
-			phone,
-			region,
-			COUNT(DISTINCT user_id) AS caseload_count
-		FROM chw_links
-		WHERE chw_user_id IS NULL
-		GROUP BY LOWER(TRIM(chw_name)), phone, region
-		ORDER BY chw_name ASC`,
-	)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "failed to load manual CHW links")
-		return
-	}
-	defer manualRows.Close()
-
-	for manualRows.Next() {
-		var (
-			name          string
-			phone         string
-			region        string
-			caseloadCount int
-		)
-		if err := manualRows.Scan(&name, &phone, &region, &caseloadCount); err != nil {
-			writeError(w, http.StatusInternalServerError, "failed to scan manual CHW links")
-			return
-		}
-		if _, exists := registeredByName[canonicalName(name)]; exists {
-			continue
-		}
-
-		items = append(items, map[string]any{
-			"id":             nil,
-			"name":           name,
-			"email":          "",
-			"phone":          phone,
-			"region":         firstNonEmpty(region, "Unassigned"),
-			"caseload_count": caseloadCount,
-			"is_registered":  false,
 		})
 	}
 
@@ -847,6 +918,7 @@ func (s *Server) handleCHWCaseload(w http.ResponseWriter, _ *http.Request, user 
 			u.id,
 			u.name,
 			u.email,
+			u.phone,
 			u.language,
 			cl.region,
 			cl.chw_name,
@@ -891,6 +963,7 @@ func (s *Server) handleCHWCaseload(w http.ResponseWriter, _ *http.Request, user 
 			patientID    int64
 			patientName  string
 			patientEmail string
+			patientPhone string
 			language     string
 			region       string
 			chwName      string
@@ -903,6 +976,7 @@ func (s *Server) handleCHWCaseload(w http.ResponseWriter, _ *http.Request, user 
 			&patientID,
 			&patientName,
 			&patientEmail,
+			&patientPhone,
 			&language,
 			&region,
 			&chwName,
@@ -923,6 +997,7 @@ func (s *Server) handleCHWCaseload(w http.ResponseWriter, _ *http.Request, user 
 			"patient_id":      patientID,
 			"patient_name":    patientName,
 			"patient_email":   patientEmail,
+			"patient_phone":   patientPhone,
 			"language":        language,
 			"region":          firstNonEmpty(region, "Unassigned"),
 			"chw_name":        chwName,
@@ -966,6 +1041,11 @@ func (s *Server) handleStartAdmission(w http.ResponseWriter, r *http.Request, us
 		writeError(w, http.StatusBadRequest, "phq9_answers are required to start admission")
 		return
 	}
+	bundle, err := buildAssessmentBundle(req)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
 
 	mood := 5
 	if req.Mood != nil {
@@ -995,10 +1075,13 @@ func (s *Server) handleStartAdmission(w http.ResponseWriter, r *http.Request, us
 
 	note := strings.TrimSpace(req.Note)
 	if note == "" {
-		note = "Admission intake completed with PHQ-9 screening."
+		note = "Admission intake completed with multi-test screening."
 	}
 
 	risk := maxRiskLevel(detectRisk(note, mood, stress, anxiety, sleepHours), phq.RiskLevel)
+	for _, screening := range bundle.Screenings {
+		risk = maxRiskLevel(risk, screening.Risk)
+	}
 
 	res, err := s.db.Exec(
 		"INSERT INTO checkins(user_id, mood, stress, anxiety, sleep_hours, note, risk_level) VALUES(?, ?, ?, ?, ?, ?, ?)",
@@ -1018,14 +1101,27 @@ func (s *Server) handleStartAdmission(w http.ResponseWriter, r *http.Request, us
 	checkinID, _ := res.LastInsertId()
 	points, _ := s.addRewardPoints(user.ID, 12)
 	chwLinked := s.hasLinkedCHW(user.ID)
-	recommendation := buildCareRecommendation(risk, phq, chwLinked, user.Language)
+	recommendation := buildCareRecommendation(risk, phq, bundle.PrimaryFocuses, chwLinked, user.Language)
+
+	screeningsJSON, _ := json.Marshal(bundle.Screenings)
+	exercisesJSON, _ := json.Marshal(bundle.Exercises)
+	focusesJSON, _ := json.Marshal(bundle.PrimaryFocuses)
+	_, _ = s.db.Exec(
+		"INSERT INTO admission_assessments(user_id, risk_level, primary_focuses, screenings_json, exercises_json, note) VALUES(?, ?, ?, ?, ?, ?)",
+		user.ID,
+		risk,
+		string(focusesJSON),
+		string(screeningsJSON),
+		string(exercisesJSON),
+		note,
+	)
 
 	if risk == "medium" || risk == "high" {
 		s.createRiskEvent(
 			user.ID,
-			"admission_phq9",
+			"admission_screening",
 			risk,
-			fmt.Sprintf("Admission PHQ-9 score %d (%s) triggered %s risk triage", phq.Score, humanizeLabel(phq.Severity), risk),
+			fmt.Sprintf("Admission screening flagged %s risk with focuses: %s", risk, strings.Join(bundle.PrimaryFocuses, ", ")),
 		)
 	}
 
@@ -1043,6 +1139,10 @@ func (s *Server) handleStartAdmission(w http.ResponseWriter, r *http.Request, us
 		"recommendation_type":     recommendation.Type,
 		"recommendation_message":  recommendation.Message,
 		"suggested_actions":       recommendation.Actions,
+		"screenings":              bundle.Screenings,
+		"primary_focuses":         bundle.PrimaryFocuses,
+		"recommended_exercises":   bundle.Exercises,
+		"progress_label":          bundle.ProgressLabel,
 		"admission_flow_complete": true,
 	})
 }
@@ -1098,7 +1198,7 @@ func (s *Server) handleCreateCheckin(w http.ResponseWriter, r *http.Request, use
 	checkinID, _ := res.LastInsertId()
 	points, _ := s.addRewardPoints(user.ID, 10)
 	chwLinked := s.hasLinkedCHW(user.ID)
-	recommendation := buildCareRecommendation(risk, phq, chwLinked, user.Language)
+	recommendation := buildCareRecommendation(risk, phq, nil, chwLinked, user.Language)
 
 	if risk == "medium" || risk == "high" {
 		eventMessage := "early detection flagged from check-in values"
@@ -1264,7 +1364,13 @@ func (s *Server) handleCreateReminder(w http.ResponseWriter, r *http.Request, us
 	}
 
 	id, _ := res.LastInsertId()
-	writeJSON(w, http.StatusCreated, map[string]any{"id": id, "message": "AI reminder saved"})
+	smsStatus, smsError := s.notifyReminderBySMS(r.Context(), user.ID, req.Title, req.ScheduleTime)
+	writeJSON(w, http.StatusCreated, map[string]any{
+		"id":          id,
+		"message":     "AI reminder saved",
+		"sms_status":  smsStatus,
+		"sms_warning": smsError,
+	})
 }
 
 func (s *Server) handleListReminders(w http.ResponseWriter, _ *http.Request, user AuthUser) {
@@ -1349,11 +1455,17 @@ func (s *Server) handleCreateAppointment(w http.ResponseWriter, r *http.Request,
 		"Therapy session reminder",
 		req.AppointmentTime,
 	)
+	smsStatus, smsError := s.notifyReminderBySMS(r.Context(), user.ID, "Therapy session reminder", req.AppointmentTime)
+	chwSMSStatus, chwSMSWarning := s.notifyAppointmentToCHW(r.Context(), user.ID, req.Therapist, req.SessionMode, req.AppointmentTime)
 
 	writeJSON(w, http.StatusCreated, map[string]any{
-		"id":            id,
-		"reward_points": points,
-		"message":       "virtual therapist session booked",
+		"id":              id,
+		"reward_points":   points,
+		"message":         "virtual therapist session booked",
+		"sms_status":      smsStatus,
+		"sms_warning":     smsError,
+		"chw_sms_status":  chwSMSStatus,
+		"chw_sms_warning": chwSMSWarning,
 	})
 }
 
@@ -1426,6 +1538,15 @@ func (s *Server) handleCreateCommunityMessage(w http.ResponseWriter, r *http.Req
 	}
 
 	id, _ := res.LastInsertId()
+	s.broadcastCommunityMessage(req.Room, map[string]any{
+		"id":         id,
+		"room":       req.Room,
+		"message":    req.Message,
+		"created_at": time.Now().UTC(),
+		"user_id":    user.ID,
+		"user_name":  user.Name,
+		"name":       user.Name,
+	})
 	writeJSON(w, http.StatusCreated, map[string]any{"id": id, "message": "message posted"})
 }
 
@@ -1848,20 +1969,71 @@ func (s *Server) handleAIAssistant(w http.ResponseWriter, r *http.Request, user 
 	if strings.TrimSpace(req.Language) == "" {
 		lang = normalizeLanguage(user.Language)
 	}
-	reply, model := s.generateChatAssistantReply(r.Context(), prompt, lang, risk)
+	contextualPrompt := prompt
+	if assessmentContext := s.latestAssessmentContext(user.ID); assessmentContext != "" {
+		contextualPrompt = assessmentContext + "\n\nUser message: " + prompt
+	}
+	reply, model := s.generateChatAssistantReply(r.Context(), contextualPrompt, lang, risk)
 	suggested := suggestedActionsByRisk(risk)
+	smsStatus, smsWarning := s.sendAIReplyBySMS(r.Context(), user.ID, firstNonEmpty(req.SMSTo, user.Phone), reply, req.SendSMS)
 
 	writeJSON(w, http.StatusOK, map[string]any{
 		"model":             model,
 		"reply":             reply,
 		"suggested_actions": suggested,
 		"risk_level":        risk,
+		"sms_status":        smsStatus,
+		"sms_warning":       smsWarning,
 	})
 }
 
 func (s *Server) generateChatAssistantReply(ctx context.Context, prompt, language, risk string) (string, string) {
 	fallbackReply, _ := fallbackAssistantReply(prompt)
 	switch normalizeAIProvider(s.aiProvider) {
+	case "vertex":
+		if strings.TrimSpace(s.vertexProjectID) != "" && strings.TrimSpace(s.vertexSAJSON) != "" {
+			reply, err := s.callVertexChatCompletion(ctx, prompt, language, risk)
+			if err == nil {
+				return reply, "Vertex AI"
+			}
+			log.Printf("vertex fallback: %v", err)
+		}
+		if strings.TrimSpace(s.geminiAPIKey) != "" {
+			reply, err := s.callGeminiChatCompletion(ctx, prompt, language, risk)
+			if err == nil {
+				return reply, "Gemini"
+			}
+			log.Printf("gemini fallback after vertex: %v", err)
+		}
+		if strings.TrimSpace(s.openAIAPIKey) != "" {
+			openAIReply, openAIErr := s.callOpenAIChatCompletion(ctx, prompt, language, risk)
+			if openAIErr == nil {
+				return openAIReply, "ChatGPT"
+			}
+			log.Printf("chatgpt fallback after vertex: %v", openAIErr)
+		}
+		reply, err := s.callLlamaChatCompletion(ctx, prompt, language, risk)
+		if err == nil {
+			return reply, "Llama-Local"
+		}
+		log.Printf("llama fallback after vertex: %v", err)
+		return fallbackReply, "MindBridge-Free"
+	case "gemini":
+		if strings.TrimSpace(s.geminiAPIKey) != "" {
+			reply, err := s.callGeminiChatCompletion(ctx, prompt, language, risk)
+			if err == nil {
+				return reply, "Gemini"
+			}
+			log.Printf("gemini fallback: %v", err)
+		}
+		if strings.TrimSpace(s.openAIAPIKey) != "" {
+			openAIReply, openAIErr := s.callOpenAIChatCompletion(ctx, prompt, language, risk)
+			if openAIErr == nil {
+				return openAIReply, "ChatGPT"
+			}
+			log.Printf("chatgpt fallback after gemini: %v", openAIErr)
+		}
+		return fallbackReply, "MindBridge-Free"
 	case "llama":
 		reply, err := s.callLlamaChatCompletion(ctx, prompt, language, risk)
 		if err == nil {
@@ -1879,11 +2051,25 @@ func (s *Server) generateChatAssistantReply(ctx context.Context, prompt, languag
 
 	case "openai":
 		if strings.TrimSpace(s.openAIAPIKey) == "" {
+			if strings.TrimSpace(s.geminiAPIKey) != "" {
+				reply, err := s.callGeminiChatCompletion(ctx, prompt, language, risk)
+				if err == nil {
+					return reply, "Gemini"
+				}
+				log.Printf("gemini fallback after missing openai key: %v", err)
+			}
 			return fallbackReply, "MindBridge-Free"
 		}
 		reply, err := s.callOpenAIChatCompletion(ctx, prompt, language, risk)
 		if err != nil {
 			log.Printf("chatgpt fallback: %v", err)
+			if strings.TrimSpace(s.geminiAPIKey) != "" {
+				geminiReply, geminiErr := s.callGeminiChatCompletion(ctx, prompt, language, risk)
+				if geminiErr == nil {
+					return geminiReply, "Gemini"
+				}
+				log.Printf("gemini fallback after chatgpt: %v", geminiErr)
+			}
 			return fallbackReply, "MindBridge-Free"
 		}
 		return reply, "ChatGPT"
@@ -1891,6 +2077,158 @@ func (s *Server) generateChatAssistantReply(ctx context.Context, prompt, languag
 	default:
 		return fallbackReply, "MindBridge-Free"
 	}
+}
+
+func (s *Server) callVertexChatCompletion(ctx context.Context, prompt, language, risk string) (string, error) {
+	token, err := s.vertexAccessToken(ctx)
+	if err != nil {
+		return "", err
+	}
+
+	lang := normalizeLanguage(language)
+	systemPrompt := fmt.Sprintf(
+		"You are a mental wellness support assistant. Reply in %s with empathy, practical guidance, and at most one gentle follow-up question. Do not diagnose. Keep it under 140 words. If risk is high, prioritize immediate safety guidance.",
+		languageDisplayName(lang),
+	)
+	payload := map[string]any{
+		"system_instruction": map[string]any{
+			"parts": []map[string]string{{"text": systemPrompt}},
+		},
+		"contents": []map[string]any{
+			{
+				"role": "user",
+				"parts": []map[string]string{
+					{"text": fmt.Sprintf("Detected risk: %s\n%s", risk, prompt)},
+				},
+			},
+		},
+		"generationConfig": map[string]any{
+			"temperature":     0.6,
+			"maxOutputTokens": 220,
+			"candidateCount":  1,
+		},
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return "", err
+	}
+
+	endpoint := strings.TrimRight(s.vertexEndpoint, "/")
+	url := fmt.Sprintf(
+		"%s/v1/projects/%s/locations/%s/publishers/google/models/%s:generateContent",
+		endpoint,
+		s.vertexProjectID,
+		s.vertexLocation,
+		s.vertexModel,
+	)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, strings.NewReader(string(body)))
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := s.httpClient.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("vertex request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if resp.StatusCode >= 300 {
+		return "", fmt.Errorf("vertex error (%d): %s", resp.StatusCode, strings.TrimSpace(string(respBody)))
+	}
+
+	return extractGeminiStyleReply(respBody, "vertex")
+}
+
+func (s *Server) callGeminiChatCompletion(ctx context.Context, prompt, language, risk string) (string, error) {
+	lang := normalizeLanguage(language)
+	systemPrompt := fmt.Sprintf(
+		"You are a mental wellness support assistant. Reply in %s with empathy, practical guidance, and at most one gentle follow-up question. Do not diagnose. Keep it under 140 words. If risk is high, prioritize immediate safety guidance.",
+		languageDisplayName(lang),
+	)
+	payload := map[string]any{
+		"system_instruction": map[string]any{
+			"parts": []map[string]string{{"text": systemPrompt}},
+		},
+		"contents": []map[string]any{
+			{
+				"role": "user",
+				"parts": []map[string]string{
+					{"text": fmt.Sprintf("Detected risk: %s\n%s", risk, prompt)},
+				},
+			},
+		},
+		"generationConfig": map[string]any{
+			"temperature":     0.6,
+			"maxOutputTokens": 220,
+			"candidateCount":  1,
+		},
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return "", err
+	}
+
+	url := fmt.Sprintf("%s/%s:generateContent?key=%s", strings.TrimRight(s.geminiChatURL, "/"), s.geminiModel, s.geminiAPIKey)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, strings.NewReader(string(body)))
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := s.httpClient.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("gemini request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if resp.StatusCode >= 300 {
+		return "", fmt.Errorf("gemini error (%d): %s", resp.StatusCode, strings.TrimSpace(string(respBody)))
+	}
+
+	return extractGeminiStyleReply(respBody, "gemini")
+}
+
+func extractGeminiStyleReply(respBody []byte, provider string) (string, error) {
+	var raw map[string]any
+	if err := json.Unmarshal(respBody, &raw); err != nil {
+		return "", fmt.Errorf("%s invalid response: %w", provider, err)
+	}
+
+	candidates, ok := raw["candidates"].([]any)
+	if !ok || len(candidates) == 0 {
+		return "", fmt.Errorf("%s returned no candidates", provider)
+	}
+	first, ok := candidates[0].(map[string]any)
+	if !ok {
+		return "", fmt.Errorf("%s candidate was invalid", provider)
+	}
+	content, ok := first["content"].(map[string]any)
+	if !ok {
+		return "", fmt.Errorf("%s content was missing", provider)
+	}
+	parts, ok := content["parts"].([]any)
+	if !ok {
+		return "", fmt.Errorf("%s parts were missing", provider)
+	}
+	lines := make([]string, 0, len(parts))
+	for _, item := range parts {
+		part, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		if text, ok := part["text"].(string); ok && strings.TrimSpace(text) != "" {
+			lines = append(lines, strings.TrimSpace(text))
+		}
+	}
+	reply := strings.Join(lines, "\n")
+	if strings.TrimSpace(reply) == "" {
+		return "", fmt.Errorf("%s returned an empty reply", provider)
+	}
+	return reply, nil
 }
 
 func (s *Server) callLlamaChatCompletion(ctx context.Context, prompt, language, risk string) (string, error) {
@@ -2058,6 +2396,18 @@ func fallbackAssistantReply(prompt string) (string, string) {
 	source := "fallback"
 
 	switch {
+	case strings.Contains(normalized, "suicide risk") || strings.Contains(normalized, "c-ssrs") || strings.Contains(normalized, "kill myself"):
+		reply = "Your screening suggests this needs immediate human support. Move toward another person, remove anything you could use to harm yourself, and contact your CHW or local emergency support now."
+	case strings.Contains(normalized, "anxiety") || strings.Contains(normalized, "gad-7"):
+		reply = "Your anxiety screen suggests we should focus on body calming first. Try paced breathing with a longer exhale for three minutes, then name five things you can see around you."
+	case strings.Contains(normalized, "ptsd") || strings.Contains(normalized, "pcl-5") || strings.Contains(normalized, "trauma"):
+		reply = "Trauma symptoms often respond better to grounding than deep analysis in the moment. Start with 5-4-3-2-1 grounding and orient yourself to the room before thinking about next steps."
+	case strings.Contains(normalized, "substance") || strings.Contains(normalized, "audit"):
+		reply = "Your substance-use screen suggests using urge-surfing right now: wait ten minutes, drink water, and move away from the trigger while the urge rises and falls."
+	case strings.Contains(normalized, "bipolar") || strings.Contains(normalized, "mdq"):
+		reply = "Because your mood screen suggests possible high-energy or impulsive periods, focus on slowing decisions down. Check sleep, avoid big spending or risky choices tonight, and arrange clinician follow-up."
+	case strings.Contains(normalized, "kessler") || strings.Contains(normalized, "distress"):
+		reply = "Your distress screen suggests overload is high. Reduce today to one or two necessary tasks, take a short reset walk, and message your CHW for structured follow-up."
 	case strings.Contains(normalized, "panic"):
 		reply = "Start 5-4-3-2-1 grounding right now, then slow your breathing. If the panic keeps rising, contact a counselor or trusted person immediately."
 	case strings.Contains(normalized, "sleep"):
@@ -2131,6 +2481,68 @@ func (s *Server) serveFrontend(w http.ResponseWriter, r *http.Request) {
 	http.ServeFile(w, r, indexPath)
 }
 
+func (s *Server) handleCommunitySocket(w http.ResponseWriter, r *http.Request) {
+	room := strings.TrimSpace(strings.ToLower(r.URL.Query().Get("room")))
+	if room == "" {
+		writeError(w, http.StatusBadRequest, "room is required")
+		return
+	}
+
+	conn, err := s.wsUpgrader.Upgrade(w, r, nil)
+	if err != nil {
+		return
+	}
+
+	s.communityMu.Lock()
+	if _, ok := s.communityRooms[room]; !ok {
+		s.communityRooms[room] = make(map[*websocket.Conn]struct{})
+	}
+	s.communityRooms[room][conn] = struct{}{}
+	s.communityMu.Unlock()
+
+	defer func() {
+		s.communityMu.Lock()
+		if clients, ok := s.communityRooms[room]; ok {
+			delete(clients, conn)
+			if len(clients) == 0 {
+				delete(s.communityRooms, room)
+			}
+		}
+		s.communityMu.Unlock()
+		_ = conn.Close()
+	}()
+
+	for {
+		if _, _, err := conn.ReadMessage(); err != nil {
+			return
+		}
+	}
+}
+
+func (s *Server) broadcastCommunityMessage(room string, payload map[string]any) {
+	s.communityMu.RLock()
+	clients := make([]*websocket.Conn, 0, len(s.communityRooms[room]))
+	for conn := range s.communityRooms[room] {
+		clients = append(clients, conn)
+	}
+	s.communityMu.RUnlock()
+
+	envelope := map[string]any{
+		"type":    "community_message",
+		"payload": payload,
+	}
+	for _, conn := range clients {
+		if err := conn.WriteJSON(envelope); err != nil {
+			s.communityMu.Lock()
+			if roomClients, ok := s.communityRooms[room]; ok {
+				delete(roomClients, conn)
+			}
+			s.communityMu.Unlock()
+			_ = conn.Close()
+		}
+	}
+}
+
 func (s *Server) withAuth(handler func(http.ResponseWriter, *http.Request, AuthUser)) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		user, err := s.authenticate(r)
@@ -2162,12 +2574,12 @@ func (s *Server) authenticate(r *http.Request) (AuthUser, error) {
 	)
 
 	err := s.db.QueryRow(
-		`SELECT u.id, u.name, u.email, u.language, u.role, sess.expires_at
+		`SELECT u.id, u.name, u.email, u.phone, u.language, u.role, sess.expires_at
 		 FROM sessions sess
 		 JOIN users u ON u.id = sess.user_id
 		 WHERE sess.token = ?`,
 		token,
-	).Scan(&user.ID, &user.Name, &user.Email, &user.Language, &user.Role, &expiresAt)
+	).Scan(&user.ID, &user.Name, &user.Email, &user.Phone, &user.Language, &user.Role, &expiresAt)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return AuthUser{}, errors.New("invalid session token")
@@ -2200,9 +2612,104 @@ func (s *Server) createSession(userID int64) (string, error) {
 
 func (s *Server) getUserByID(id int64) (AuthUser, error) {
 	var user AuthUser
-	err := s.db.QueryRow("SELECT id, name, email, language, role FROM users WHERE id = ?", id).Scan(&user.ID, &user.Name, &user.Email, &user.Language, &user.Role)
+	err := s.db.QueryRow("SELECT id, name, email, phone, language, role FROM users WHERE id = ?", id).Scan(&user.ID, &user.Name, &user.Email, &user.Phone, &user.Language, &user.Role)
 	user.Role = normalizeRole(user.Role)
 	return user, err
+}
+
+func (s *Server) getUserPhone(userID int64) string {
+	var phone string
+	_ = s.db.QueryRow("SELECT phone FROM users WHERE id = ?", userID).Scan(&phone)
+	return strings.TrimSpace(phone)
+}
+
+func (s *Server) getLinkedCHWPhone(userID int64) string {
+	var phone string
+	_ = s.db.QueryRow(
+		`SELECT COALESCE(NULLIF(TRIM(cl.phone), ''), '')
+		 FROM chw_links cl
+		 WHERE cl.user_id = ?
+		 ORDER BY cl.created_at DESC, cl.id DESC
+		 LIMIT 1`,
+		userID,
+	).Scan(&phone)
+	return strings.TrimSpace(phone)
+}
+
+func (s *Server) latestAssessmentContext(userID int64) string {
+	var (
+		focuses    string
+		screenings string
+	)
+	err := s.db.QueryRow(
+		`SELECT primary_focuses, screenings_json
+		 FROM admission_assessments
+		 WHERE user_id = ?
+		 ORDER BY created_at DESC, id DESC
+		 LIMIT 1`,
+		userID,
+	).Scan(&focuses, &screenings)
+	if err != nil {
+		return ""
+	}
+	return fmt.Sprintf("Latest screening focuses: %s\nLatest screening results: %s", focuses, screenings)
+}
+
+func (s *Server) notifyReminderBySMS(ctx context.Context, userID int64, title, scheduleTime string) (string, string) {
+	phone := s.getUserPhone(userID)
+	if phone == "" {
+		return "skipped", "patient phone number is not on file"
+	}
+
+	message := fmt.Sprintf("AfyaMind reminder: %s at %s", title, scheduleTime)
+	result, err := s.sendSMSViaDevText(ctx, phone, message)
+	if err != nil {
+		return "failed", err.Error()
+	}
+
+	_, _ = s.db.Exec(
+		"INSERT INTO sms_logs(user_id, to_number, message, provider_status, provider_id) VALUES(?, ?, ?, ?, ?)",
+		userID,
+		phone,
+		message,
+		result.ProviderStatus,
+		result.ProviderID,
+	)
+	return result.ProviderStatus, ""
+}
+
+func (s *Server) notifyAppointmentToCHW(ctx context.Context, userID int64, therapist, sessionMode, appointmentTime string) (string, string) {
+	phone := s.getLinkedCHWPhone(userID)
+	if phone == "" {
+		return "skipped", "linked CHW phone number is not on file"
+	}
+
+	userRecord, err := s.getUserByID(userID)
+	if err != nil {
+		return "failed", err.Error()
+	}
+
+	message := fmt.Sprintf(
+		"AfyaMind booking: %s booked a %s session with %s for %s.",
+		userRecord.Name,
+		strings.ReplaceAll(sessionMode, "_", " "),
+		therapist,
+		appointmentTime,
+	)
+	result, err := s.sendSMSViaDevText(ctx, phone, message)
+	if err != nil {
+		return "failed", err.Error()
+	}
+
+	_, _ = s.db.Exec(
+		"INSERT INTO sms_logs(user_id, to_number, message, provider_status, provider_id) VALUES(?, ?, ?, ?, ?)",
+		userID,
+		phone,
+		message,
+		result.ProviderStatus,
+		result.ProviderID,
+	)
+	return result.ProviderStatus, ""
 }
 
 func (s *Server) addRewardPoints(userID int64, points int) (int, error) {
@@ -2331,6 +2838,135 @@ func (s *Server) sendSMSViaDevText(ctx context.Context, to, message string) (sms
 	}, nil
 }
 
+func (s *Server) sendAIReplyBySMS(ctx context.Context, userID int64, to, reply string, shouldSend bool) (string, string) {
+	if !shouldSend {
+		return "skipped", ""
+	}
+	to = strings.TrimSpace(to)
+	reply = strings.TrimSpace(reply)
+	if to == "" {
+		return "skipped", "Add a phone number to text the AI reply."
+	}
+	if reply == "" {
+		return "skipped", "There was no AI reply to send by SMS."
+	}
+
+	message := "AfyaMind AI: " + reply
+	if len([]rune(message)) > 320 {
+		runes := []rune(message)
+		message = string(runes[:317]) + "..."
+	}
+
+	result, err := s.sendSMSViaDevText(ctx, to, message)
+	if err != nil {
+		return "failed", err.Error()
+	}
+
+	_, _ = s.db.Exec(
+		"INSERT INTO sms_logs(user_id, to_number, message, provider_status, provider_id) VALUES(?, ?, ?, ?, ?)",
+		userID,
+		to,
+		message,
+		result.ProviderStatus,
+		result.ProviderID,
+	)
+
+	return result.ProviderStatus, ""
+}
+
+func (s *Server) vertexAccessToken(ctx context.Context) (string, error) {
+	if strings.TrimSpace(s.vertexSAJSON) == "" {
+		return "", errors.New("VERTEX_SERVICE_ACCOUNT_JSON is missing")
+	}
+	if strings.TrimSpace(s.vertexProjectID) == "" {
+		return "", errors.New("VERTEX_PROJECT_ID is missing")
+	}
+
+	var creds struct {
+		ClientEmail string `json:"client_email"`
+		PrivateKey  string `json:"private_key"`
+		TokenURI    string `json:"token_uri"`
+	}
+	if err := json.Unmarshal([]byte(s.vertexSAJSON), &creds); err != nil {
+		return "", fmt.Errorf("invalid vertex service account json: %w", err)
+	}
+	if strings.TrimSpace(creds.ClientEmail) == "" || strings.TrimSpace(creds.PrivateKey) == "" {
+		return "", errors.New("vertex service account json is missing client_email or private_key")
+	}
+
+	block, _ := pem.Decode([]byte(creds.PrivateKey))
+	if block == nil {
+		return "", errors.New("vertex private key could not be decoded")
+	}
+
+	parsedKey, err := x509.ParsePKCS8PrivateKey(block.Bytes)
+	if err != nil {
+		rsaKey, rsaErr := x509.ParsePKCS1PrivateKey(block.Bytes)
+		if rsaErr != nil {
+			return "", fmt.Errorf("vertex private key parse failed: %w", err)
+		}
+		parsedKey = rsaKey
+	}
+
+	rsaKey, ok := parsedKey.(*rsa.PrivateKey)
+	if !ok {
+		return "", errors.New("vertex private key must be RSA")
+	}
+
+	tokenURI := firstNonEmpty(strings.TrimSpace(creds.TokenURI), "https://oauth2.googleapis.com/token")
+	now := time.Now().UTC()
+	headerJSON, _ := json.Marshal(map[string]string{
+		"alg": "RS256",
+		"typ": "JWT",
+	})
+	claimsJSON, _ := json.Marshal(map[string]any{
+		"iss":   creds.ClientEmail,
+		"scope": "https://www.googleapis.com/auth/cloud-platform",
+		"aud":   tokenURI,
+		"iat":   now.Unix(),
+		"exp":   now.Add(time.Hour).Unix(),
+	})
+
+	unsigned := base64.RawURLEncoding.EncodeToString(headerJSON) + "." + base64.RawURLEncoding.EncodeToString(claimsJSON)
+	hash := sha256.Sum256([]byte(unsigned))
+	signature, err := rsa.SignPKCS1v15(rand.Reader, rsaKey, crypto.SHA256, hash[:])
+	if err != nil {
+		return "", fmt.Errorf("vertex jwt signing failed: %w", err)
+	}
+	assertion := unsigned + "." + base64.RawURLEncoding.EncodeToString(signature)
+
+	form := strings.NewReader(
+		"grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Ajwt-bearer&assertion=" + assertion,
+	)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, tokenURI, form)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+
+	resp, err := s.httpClient.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("vertex token request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if resp.StatusCode >= 300 {
+		return "", fmt.Errorf("vertex token error (%d): %s", resp.StatusCode, strings.TrimSpace(string(respBody)))
+	}
+
+	var tokenResp struct {
+		AccessToken string `json:"access_token"`
+	}
+	if err := json.Unmarshal(respBody, &tokenResp); err != nil {
+		return "", fmt.Errorf("vertex token response invalid: %w", err)
+	}
+	if strings.TrimSpace(tokenResp.AccessToken) == "" {
+		return "", errors.New("vertex token response was empty")
+	}
+	return tokenResp.AccessToken, nil
+}
+
 func detectRisk(text string, mood, stress, anxiety int, sleepHours float64) string {
 	normalized := strings.ToLower(strings.TrimSpace(text))
 	highSignals := []string{"suicide", "kill myself", "end my life", "hopeless", "no reason to live"}
@@ -2405,6 +3041,366 @@ func assessPHQ9(answers []int) (phq9Assessment, error) {
 	}, nil
 }
 
+func buildAssessmentBundle(req admissionRequest) (assessmentBundle, error) {
+	gad7, err := assessLikertScale("gad7_answers", "Anxiety (GAD-7)", req.GAD7Answers, 7, 0, 3,
+		func(score int) (string, string, string) {
+			switch {
+			case score >= 15:
+				return "severe", "high", "Severe anxiety symptoms detected."
+			case score >= 10:
+				return "moderate", "medium", "Moderate anxiety symptoms detected."
+			case score >= 5:
+				return "mild", "low", "Mild anxiety symptoms detected."
+			default:
+				return "minimal", "low", "Minimal anxiety symptoms detected."
+			}
+		},
+	)
+	if err != nil {
+		return assessmentBundle{}, err
+	}
+
+	pcl5, err := assessLikertScale("pcl5_answers", "PTSD (PCL-5)", req.PCL5Answers, 20, 0, 4,
+		func(score int) (string, string, string) {
+			switch {
+			case score >= 50:
+				return "very_high", "high", "PTSD symptoms are very elevated."
+			case score >= 33:
+				return "probable_ptsd", "medium", "PTSD symptoms are above the usual screening threshold."
+			case score >= 20:
+				return "elevated", "low", "Some trauma-related symptoms are present."
+			default:
+				return "low", "low", "Trauma-related symptoms are currently low."
+			}
+		},
+	)
+	if err != nil {
+		return assessmentBundle{}, err
+	}
+
+	kessler, err := assessLikertScale("kessler_answers", "Psychological distress (Kessler)", req.KesslerAnswers, 10, 1, 5,
+		func(score int) (string, string, string) {
+			switch {
+			case score >= 30:
+				return "very_high", "high", "Very high psychological distress is present."
+			case score >= 25:
+				return "high", "medium", "High psychological distress is present."
+			case score >= 20:
+				return "moderate", "low", "Moderate psychological distress is present."
+			default:
+				return "low", "low", "Psychological distress is in the lower range."
+			}
+		},
+	)
+	if err != nil {
+		return assessmentBundle{}, err
+	}
+
+	mdq, err := assessMDQ(req.MDQAnswers, req.MDQConcurrent, req.MDQImpairment)
+	if err != nil {
+		return assessmentBundle{}, err
+	}
+
+	audit, err := assessLikertScale("audit_answers", "Substance use (AUDIT)", req.AUDITAnswers, 10, 0, 4,
+		func(score int) (string, string, string) {
+			switch {
+			case score >= 20:
+				return "possible_dependence", "high", "Substance use score suggests possible dependence."
+			case score >= 16:
+				return "harmful_use", "medium", "Substance use score suggests harmful use."
+			case score >= 8:
+				return "hazardous_use", "medium", "Substance use score suggests hazardous use."
+			default:
+				return "low_risk", "low", "Substance use score is in the lower-risk range."
+			}
+		},
+	)
+	if err != nil {
+		return assessmentBundle{}, err
+	}
+
+	cssrs, err := assessCSSRS(req.CSSRSAnswers)
+	if err != nil {
+		return assessmentBundle{}, err
+	}
+
+	phqSummary := screeningAssessment{
+		Key:      "phq9",
+		Title:    "Depression (PHQ-9)",
+		Score:    reqSum(req.PHQ9Answers),
+		MaxScore: 27,
+		Level:    phqSeverityLabelFromScore(reqSum(req.PHQ9Answers)),
+		Risk:     "low",
+		Summary:  "Depression symptoms assessed with PHQ-9.",
+	}
+	phq, err := assessPHQ9(req.PHQ9Answers)
+	if err != nil {
+		return assessmentBundle{}, err
+	}
+	phqSummary.Score = phq.Score
+	phqSummary.Level = phq.Severity
+	phqSummary.Risk = phq.RiskLevel
+	phqSummary.Summary = fmt.Sprintf("PHQ-9 score %d indicates %s depression symptoms.", phq.Score, humanizeLabel(phq.Severity))
+
+	screenings := []screeningAssessment{phqSummary, gad7, pcl5, kessler, mdq, audit, cssrs}
+	focuses := derivePrimaryFocuses(phq, screenings)
+	if req.PrimaryConcern = strings.ToLower(strings.TrimSpace(req.PrimaryConcern)); req.PrimaryConcern != "" {
+		focuses = prependUnique(focuses, req.PrimaryConcern)
+	}
+
+	return assessmentBundle{
+		PHQ9:           phq,
+		Screenings:     screenings,
+		PrimaryFocuses: focuses,
+		Exercises:      recommendedExercisesForFocuses(focuses),
+		ProgressLabel:  fmt.Sprintf("Completed %d of %d screening sections", len(screenings), len(screenings)),
+	}, nil
+}
+
+func assessLikertScale(fieldName, title string, answers []int, expected, min, max int, evaluator func(int) (string, string, string)) (screeningAssessment, error) {
+	if len(answers) != expected {
+		return screeningAssessment{}, fmt.Errorf("%s must contain %d values", fieldName, expected)
+	}
+	if len(answers) == 0 {
+		return screeningAssessment{}, fmt.Errorf("%s are required", fieldName)
+	}
+	score := 0
+	for i, value := range answers {
+		if value < min || value > max {
+			return screeningAssessment{}, fmt.Errorf("%s[%d] must be between %d and %d", fieldName, i, min, max)
+		}
+		score += value
+	}
+	level, risk, summary := evaluator(score)
+	return screeningAssessment{
+		Key:      normalizeAssessmentKey(title),
+		Title:    title,
+		Score:    score,
+		MaxScore: len(answers) * max,
+		Level:    level,
+		Risk:     risk,
+		Summary:  summary,
+	}, nil
+}
+
+func assessMDQ(answers []bool, concurrent bool, impairment int) (screeningAssessment, error) {
+	if len(answers) != 13 {
+		return screeningAssessment{}, fmt.Errorf("mdq_answers must contain 13 yes/no values")
+	}
+	if impairment < 0 || impairment > 3 {
+		return screeningAssessment{}, fmt.Errorf("mdq_impairment must be between 0 and 3")
+	}
+	yesCount := 0
+	for _, answer := range answers {
+		if answer {
+			yesCount++
+		}
+	}
+	level := "negative"
+	risk := "low"
+	summary := "MDQ screen is below the usual positive threshold."
+	if yesCount >= 7 && concurrent && impairment >= 2 {
+		level = "positive"
+		risk = "medium"
+		summary = "MDQ pattern suggests bipolar-spectrum follow-up is warranted."
+	} else if yesCount >= 7 {
+		level = "monitor"
+		summary = "Several bipolar-spectrum symptoms were endorsed, but the full positive pattern was not met."
+	}
+	return screeningAssessment{
+		Key:      "mdq",
+		Title:    "Bipolar symptoms (MDQ)",
+		Score:    yesCount,
+		MaxScore: 13,
+		Level:    level,
+		Risk:     risk,
+		Summary:  summary,
+	}, nil
+}
+
+func assessCSSRS(answers []bool) (screeningAssessment, error) {
+	if len(answers) != 6 {
+		return screeningAssessment{}, fmt.Errorf("cssrs_answers must contain 6 yes/no values")
+	}
+	level := "none"
+	risk := "low"
+	summary := "No suicide risk items were endorsed."
+	score := 0
+	for _, answer := range answers {
+		if answer {
+			score++
+		}
+	}
+	switch {
+	case answers[5] || answers[4] || answers[3]:
+		level = "high"
+		risk = "high"
+		summary = "High suicide risk items were endorsed and require immediate follow-up."
+	case answers[2] || answers[1] || answers[0]:
+		level = "elevated"
+		risk = "medium"
+		summary = "Suicidal ideation items were endorsed and require prompt support."
+	}
+	return screeningAssessment{
+		Key:      "cssrs",
+		Title:    "Suicide risk (C-SSRS)",
+		Score:    score,
+		MaxScore: 6,
+		Level:    level,
+		Risk:     risk,
+		Summary:  summary,
+	}, nil
+}
+
+func derivePrimaryFocuses(phq phq9Assessment, screenings []screeningAssessment) []string {
+	focuses := make([]string, 0)
+	if phq.Score >= 10 {
+		focuses = append(focuses, "depression")
+	}
+	for _, screening := range screenings {
+		switch screening.Key {
+		case "gad7":
+			if screening.Score >= 10 {
+				focuses = append(focuses, "anxiety")
+			}
+		case "pcl5":
+			if screening.Score >= 33 {
+				focuses = append(focuses, "ptsd")
+			}
+		case "kessler":
+			if screening.Score >= 25 {
+				focuses = append(focuses, "psychological_distress")
+			}
+		case "mdq":
+			if screening.Level == "positive" {
+				focuses = append(focuses, "bipolar_risk")
+			}
+		case "audit":
+			if screening.Score >= 8 {
+				focuses = append(focuses, "substance_use")
+			}
+		case "cssrs":
+			if screening.Risk != "low" {
+				focuses = append(focuses, "suicide_risk")
+			}
+		}
+	}
+	if len(focuses) == 0 {
+		focuses = append(focuses, "general_wellness")
+	}
+	return uniqueStrings(focuses)
+}
+
+func recommendedExercisesForFocuses(focuses []string) []exerciseRecommendation {
+	exercises := make([]exerciseRecommendation, 0, 3)
+	add := func(item exerciseRecommendation) {
+		for _, existing := range exercises {
+			if existing.Key == item.Key {
+				return
+			}
+		}
+		exercises = append(exercises, item)
+	}
+
+	for _, focus := range focuses {
+		switch focus {
+		case "anxiety":
+			add(exerciseRecommendation{Key: "paced_breathing", Title: "Paced Breathing", Duration: "3 min", Description: "Breathe in for 4, out for 6, and stay with the longer exhale.", Focus: focus})
+		case "ptsd":
+			add(exerciseRecommendation{Key: "grounding_54321", Title: "5-4-3-2-1 Grounding", Duration: "4 min", Description: "Name 5 things you see, 4 you feel, 3 you hear, 2 you smell, and 1 you taste.", Focus: focus})
+		case "psychological_distress":
+			add(exerciseRecommendation{Key: "reset_walk", Title: "Reset Walk", Duration: "5 min", Description: "Walk slowly and count your steps with steady breathing.", Focus: focus})
+		case "depression":
+			add(exerciseRecommendation{Key: "behavioral_activation", Title: "Small Activation Step", Duration: "10 min", Description: "Choose one tiny task you can complete now, like showering, stretching, or stepping outside.", Focus: focus})
+		case "bipolar_risk":
+			add(exerciseRecommendation{Key: "rhythm_check", Title: "Daily Rhythm Check", Duration: "5 min", Description: "Pause to log sleep, energy, and spending or impulsivity patterns before acting.", Focus: focus})
+		case "substance_use":
+			add(exerciseRecommendation{Key: "urge_surfing", Title: "Urge Surfing", Duration: "7 min", Description: "Notice the craving rise and fall without acting on it for the next seven minutes.", Focus: focus})
+		case "suicide_risk":
+			add(exerciseRecommendation{Key: "safety_anchor", Title: "Safety Anchor", Duration: "5 min", Description: "Move toward another person, remove immediate means, and text or call a trusted support now.", Focus: focus})
+		default:
+			add(exerciseRecommendation{Key: "box_breathing", Title: "Box Breathing", Duration: "2 min", Description: "Breathe in, hold, out, and hold for four counts each.", Focus: "general_wellness"})
+		}
+		if len(exercises) >= 3 {
+			break
+		}
+	}
+	if len(exercises) == 0 {
+		add(exerciseRecommendation{Key: "box_breathing", Title: "Box Breathing", Duration: "2 min", Description: "Breathe in, hold, out, and hold for four counts each.", Focus: "general_wellness"})
+	}
+	return exercises
+}
+
+func phqSeverityLabelFromScore(score int) string {
+	switch {
+	case score >= 20:
+		return "severe"
+	case score >= 15:
+		return "moderately_severe"
+	case score >= 10:
+		return "moderate"
+	case score >= 5:
+		return "mild"
+	default:
+		return "minimal"
+	}
+}
+
+func reqSum(values []int) int {
+	total := 0
+	for _, value := range values {
+		total += value
+	}
+	return total
+}
+
+func normalizeAssessmentKey(title string) string {
+	title = strings.ToLower(strings.TrimSpace(title))
+	switch {
+	case strings.Contains(title, "gad-7"):
+		return "gad7"
+	case strings.Contains(title, "pcl-5"):
+		return "pcl5"
+	case strings.Contains(title, "kessler"):
+		return "kessler"
+	case strings.Contains(title, "audit"):
+		return "audit"
+	default:
+		return strings.ReplaceAll(title, " ", "_")
+	}
+}
+
+func uniqueStrings(items []string) []string {
+	seen := map[string]struct{}{}
+	out := make([]string, 0, len(items))
+	for _, item := range items {
+		item = strings.TrimSpace(item)
+		if item == "" {
+			continue
+		}
+		if _, ok := seen[item]; ok {
+			continue
+		}
+		seen[item] = struct{}{}
+		out = append(out, item)
+	}
+	return out
+}
+
+func prependUnique(items []string, item string) []string {
+	item = strings.TrimSpace(item)
+	if item == "" {
+		return items
+	}
+	out := []string{item}
+	for _, existing := range items {
+		if existing != item {
+			out = append(out, existing)
+		}
+	}
+	return uniqueStrings(out)
+}
+
 func maxRiskLevel(a, b string) string {
 	if riskRank(b) > riskRank(a) {
 		return b
@@ -2423,7 +3419,11 @@ func riskRank(level string) int {
 	}
 }
 
-func buildCareRecommendation(risk string, phq phq9Assessment, chwLinked bool, language string) careRecommendation {
+func buildCareRecommendation(risk string, phq phq9Assessment, primaryFocuses []string, chwLinked bool, language string) careRecommendation {
+	focusSummary := "mental wellness"
+	if len(primaryFocuses) > 0 {
+		focusSummary = strings.ReplaceAll(strings.Join(primaryFocuses, ", "), "_", " ")
+	}
 	switch risk {
 	case "high":
 		actions := []string{
@@ -2439,7 +3439,7 @@ func buildCareRecommendation(risk string, phq phq9Assessment, chwLinked bool, la
 		}
 		return careRecommendation{
 			Type:    "schedule_chw_meeting",
-			Message: "High-risk symptoms detected. Prioritize immediate CHW follow-up and escalate to crisis support if needed.",
+			Message: fmt.Sprintf("High-risk screening results detected around %s. Prioritize immediate CHW follow-up and escalate to crisis support if needed.", focusSummary),
 			Actions: actions,
 		}
 	case "medium":
@@ -2455,7 +3455,7 @@ func buildCareRecommendation(risk string, phq phq9Assessment, chwLinked bool, la
 		}
 		return careRecommendation{
 			Type:    "advice",
-			Message: "Moderate symptoms detected. Structured self-care and a near-term follow-up are recommended.",
+			Message: fmt.Sprintf("Moderate screening concerns were found around %s. Structured self-care and a near-term follow-up are recommended.", focusSummary),
 			Actions: actions,
 		}
 	default:
@@ -2530,10 +3530,14 @@ func normalizeRole(role string) string {
 
 func normalizeAIProvider(provider string) string {
 	switch strings.ToLower(strings.TrimSpace(provider)) {
+	case "vertex", "vertexai", "googlevertex":
+		return "vertex"
 	case "llama", "ollama":
 		return "llama"
 	case "openai", "chatgpt":
 		return "openai"
+	case "gemini", "google", "googleai":
+		return "gemini"
 	default:
 		return "fallback"
 	}
@@ -2619,6 +3623,33 @@ func envOrDefault(key, fallback string) string {
 		return value
 	}
 	return fallback
+}
+
+func loadDotEnv(path string) {
+	content, err := os.ReadFile(path)
+	if err != nil {
+		return
+	}
+
+	lines := strings.Split(string(content), "\n")
+	for _, rawLine := range lines {
+		line := strings.TrimSpace(rawLine)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+
+		key, value, ok := strings.Cut(line, "=")
+		if !ok {
+			continue
+		}
+
+		key = strings.Trim(strings.TrimSpace(key), `"'`)
+		value = strings.Trim(strings.TrimSpace(value), `"'`)
+		if key == "" || os.Getenv(key) != "" {
+			continue
+		}
+		_ = os.Setenv(key, value)
+	}
 }
 
 func withCORS(next http.Handler) http.Handler {
